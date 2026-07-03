@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# recordings/ is intentionally NOT ignored -- it is the data this repo
+# exists to hold, committed continuously by .github/workflows/record.yml.

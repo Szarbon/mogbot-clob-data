@@ -1,0 +1,114 @@
+name: record
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Watchdog restart every 4 hours in case the self-chain ever breaks
+    # (Actions cron is best-effort and can jitter by several minutes).
+    - cron: "0 */4 * * *"
+
+# Never run two recorder jobs at once -- queue instead of overlapping so
+# git history and the tape stay consistent. Do NOT cancel an in-progress
+# recording to start a new one.
+concurrency:
+  group: recorder
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Scan tracked files for secret patterns
+        run: bash .github/scripts/secret_scan.sh
+
+  record:
+    name: record
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "mogbot-clob-data-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Record in 14-minute chunks, committing after each chunk
+        run: |
+          set -euo pipefail
+
+          # Total wall-clock budget for this job. Kept safely under the
+          # 350-minute job timeout to leave room for setup, commits, and
+          # the final self-chain dispatch.
+          TOTAL_BUDGET_SEC=$((320 * 60))
+          CHUNK_MIN=14
+
+          start_ts=$(date +%s)
+          chunk=0
+
+          while true; do
+            now_ts=$(date +%s)
+            elapsed=$(( now_ts - start_ts ))
+            if [ "$elapsed" -ge "$TOTAL_BUDGET_SEC" ]; then
+              echo "Budget reached (${elapsed}s elapsed). Stopping recorder loop."
+              break
+            fi
+
+            chunk=$((chunk + 1))
+            echo "=== Chunk $chunk: recording for ${CHUNK_MIN} minutes ==="
+            python recorder.py record --duration-min "$CHUNK_MIN" --out-dir recordings || {
+              echo "Recorder chunk failed (non-zero exit). Continuing to next chunk."
+            }
+
+            # Guard against committing anything outside recordings/ (e.g. a
+            # rogue __pycache__ from the interpreter run).
+            bash .github/scripts/secret_scan.sh
+
+            if [ -n "$(git status --porcelain recordings)" ]; then
+              git add recordings
+              git commit -m "data: chunk ${chunk} recordings $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+              # Retry push with rebase in case the schedule watchdog or a
+              # prior chained run pushed in between (concurrency group
+              # should prevent this, but stay defensive).
+              push_ok=0
+              for attempt in 1 2 3 4 5; do
+                if git push origin HEAD:main; then
+                  push_ok=1
+                  break
+                fi
+                echo "Push attempt ${attempt} failed, pulling --rebase and retrying..."
+                git pull --rebase origin main || true
+                sleep 5
+              done
+              if [ "$push_ok" -ne 1 ]; then
+                echo "::error::Failed to push chunk ${chunk} after retries."
+                exit 1
+              fi
+            else
+              echo "No new recordings in chunk ${chunk} (all assets failed?) -- nothing to commit."
+            fi
+          done
+
+      - name: Self-chain -- dispatch the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run record.yml --ref main
